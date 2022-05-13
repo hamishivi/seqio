@@ -90,7 +90,7 @@ class TasksTest(test_utils.FakeTaskTest):
     with self.assertRaisesWithLiteralMatch(
         ValueError,
         "'missing_shuff' must have positional args ('split', 'shuffle_files'), "
-        "got: ('split',)"):
+        "or ('split', 'shuffle_files', 'seed'), got: ('split',)"):
 
       def missing_shuff(split):
         del split
@@ -100,7 +100,7 @@ class TasksTest(test_utils.FakeTaskTest):
     with self.assertRaisesWithLiteralMatch(
         ValueError,
         "'missing_split' must have positional args ('split', 'shuffle_files'), "
-        "got: ('shuffle_files',)"):
+        "or ('split', 'shuffle_files', 'seed'), got: ('shuffle_files',)"):
 
       def missing_split(shuffle_files):
         del shuffle_files
@@ -109,7 +109,8 @@ class TasksTest(test_utils.FakeTaskTest):
 
     with self.assertRaisesWithLiteralMatch(
         ValueError, "'extra_pos_arg' may only have positional args ('split', "
-        "'shuffle_files'), got: ('split', 'shuffle_files', 'unused_arg')"):
+        "'shuffle_files') or ('split', 'shuffle_files', 'seed'), got: "
+        "('split', 'shuffle_files', 'unused_arg')"):
 
       def extra_pos_arg(split, shuffle_files, unused_arg):
         del split
