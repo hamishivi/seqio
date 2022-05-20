@@ -1089,6 +1089,8 @@ class Task(DatasetProviderBase):
             self.name,
             potential_cache_dirs,
         )
+    logging.info("Using cache directory %s for '%s'.", self._cache_dir,
+                 self.name)
     return self._cache_dir
 
   @property
