@@ -28,7 +28,15 @@ mock = absltest.mock
 
 
 def _decode_tf(vocab, tokens):
-  return vocab.decode_tf(tf.constant(tokens, tf.int32)).numpy().decode("UTF-8")
+  results = vocab.decode_tf(tf.constant(tokens, tf.int32)).numpy()
+
+  def _apply(fun, sequence):
+    if isinstance(sequence, (list, np.ndarray)):
+      return [_apply(fun, x) for x in sequence]
+    else:
+      return fun(sequence)
+
+  return _apply(lambda x: x.decode("UTF-8"), results)
 
 
 class VocabularyTest(absltest.TestCase):
@@ -223,6 +231,8 @@ class UnigramVocabularyTest(absltest.TestCase):
       self.assertEqual(vocabulary.decode([1]), "this")
       self.assertEqual(vocabulary.decode([3]), "is")
       self.assertEqual(vocabulary.decode([vocabulary.unk_id]), "UNK")
+      self.assertEqual(vocabulary.encode("this"), [1])
+      self.assertEqual(vocabulary.encode("is"), [3])
     with self.subTest(name="tensorflow"):
       # Note that this test must pass under both TF1 and TF2, but the default
       # behavior of TF1 == among tensors is to compare object references, not
@@ -234,13 +244,34 @@ class UnigramVocabularyTest(absltest.TestCase):
       self.assertEqual(
           vocabulary.decode_tf(tf.constant([vocabulary.unk_id])).numpy(),
           b"UNK")
-
+      self.assertEqual(vocabulary.encode_tf(tf.constant("that")).numpy(), [2])
+      self.assertEqual(vocabulary.encode_tf(tf.constant("not")).numpy(), [4])
 
 class SentencepieceVocabularyTest(absltest.TestCase):
 
   TEST_STRING = "this is a test"
   TEST_TOKENS = (11, 8, 6, 3, 8, 6, 3, 5, 10)
   UNK_STRING = " ⁇ "
+
+  def test_decode_tf(self):
+    vocab = test_utils.sentencepiece_vocab()
+
+    for rank in range(0, 3):
+      ids = self.TEST_TOKENS
+      expected_str = self.TEST_STRING
+
+      # Creates an arbitrarly nested tensor.
+      for _ in range(rank):
+        ids = [ids]
+        expected_str = [expected_str]
+
+      # single sequences to decode
+      self.assertEqual(expected_str, _decode_tf(vocab, ids))
+
+      # multiple sequences to decode
+      res = _decode_tf(vocab, (ids, ids))
+      exp = [expected_str] * 2
+      self.assertEqual(exp, res)
 
   def test_vocab(self):
     vocab = test_utils.sentencepiece_vocab()
@@ -305,6 +336,35 @@ class ByteVocabularyTest(absltest.TestCase):
   TEST_STRING = "this is a test"
   TEST_BYTE_IDS = (
       119, 107, 108, 118, 35, 108, 118, 35, 100, 35, 119, 104, 118, 119)
+
+  def test_decode_tf(self):
+    vocab = vocabularies.ByteVocabulary()
+
+    for rank in range(0, 3):
+      ids = self.TEST_BYTE_IDS
+      expected_str = self.TEST_STRING
+
+      # Creates an arbitrarly nested tensor.
+      for _ in range(rank):
+        ids = [ids]
+        expected_str = [expected_str]
+
+      # single sequences to decode
+      self.assertEqual(expected_str, _decode_tf(vocab, ids))
+
+      # multiple sequences to decode
+      res = _decode_tf(vocab, (ids, ids))
+      exp = [expected_str] * 2
+      self.assertEqual(exp, res)
+
+  def test_decode_tf_oov_tokens(self):
+    vocab = vocabularies.ByteVocabulary()
+
+    # Add two ids that are outside the allowed interval. They should be ignored.
+    ids = tuple(list(self.TEST_BYTE_IDS) + [3000, -4000])
+    expected_str = self.TEST_STRING
+
+    self.assertEqual(expected_str, _decode_tf(vocab, ids))
 
   def test_vocab(self):
     vocab = vocabularies.ByteVocabulary()

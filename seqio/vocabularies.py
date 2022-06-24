@@ -216,7 +216,7 @@ class UnigramVocabulary(Vocabulary):
 
   def _encode_tf(self, s: tf.Tensor) -> tf.Tensor:
     tf_ids = self._id_by_unigram_tf.lookup(s)
-    return tf.dtypes.cast(tf_ids, tf.int32)
+    return tf.expand_dims(tf.dtypes.cast(tf_ids, tf.int32), -1)
 
   def _decode(self, ids: Sequence[int]) -> str:
     return " ".join(self._unigram_by_id[id] for id in ids)
@@ -416,9 +416,9 @@ class SentencePieceVocabulary(Vocabulary):
     """Decode in TensorFlow.
 
     Args:
-      ids: a 1d tf.Tensor with dtype tf.int32
+      ids: a 1d or 2d tf.Tensor with dtype tf.int32
     Returns:
-      a tf Scalar with dtype tf.string
+      a 1d or 2d tf.Tensor with dtype tf.string
     """
     return self.tf_tokenizer.detokenize(ids)
 
@@ -559,11 +559,19 @@ class ByteVocabulary(Vocabulary):
     """Decode in TensorFlow.
 
     Args:
-      ids: a 1d tf.Tensor with dtype tf.int32
+      ids: a n-d tf.Tensor with dtype tf.int32
     Returns:
-      a tf Scalar with dtype tf.string
+      a n-d tf.Tensor with dtype tf.string
     """
-    return tf.py_function(func=self.decode, inp=[ids], Tout=tf.string)
+    lower_bound = self._num_special_tokens
+    upper_bound = self._byte_size + self._num_special_tokens
+    ids = tf.ragged.boolean_mask(
+        data=ids,
+        mask=tf.math.logical_and(
+            tf.math.greater_equal(ids, lower_bound),
+            tf.math.less(ids, upper_bound)))
+    ids = ids - self._num_special_tokens
+    return tf.strings.unicode_encode(ids, "UTF-8", errors="ignore")
 
   def __eq__(self, other):
     if not isinstance(other, ByteVocabulary):

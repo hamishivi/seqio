@@ -1131,7 +1131,8 @@ class Task(DatasetProviderBase):
                   shuffle_buffer_size: Optional[int] = None,
                   seed: Optional[int] = None,
                   shard_info: Optional[ShardInfo] = None,
-                  num_epochs: Optional[int] = 1) -> tf.data.Dataset:
+                  num_epochs: Optional[int] = 1,
+                  trim_output_features: bool = True) -> tf.data.Dataset:
     """Returns a tf.data.Dataset from cache or generated on the fly.
 
     Args:
@@ -1155,6 +1156,8 @@ class Task(DatasetProviderBase):
         after offline caching, but before applying potentially stochastic
         post-cache preprocessors and is therefore typically preferred to calling
         `repeat()` on the returned dataset. Defaults to `1`.
+        trim_output_features: If True, it trims output features to be less than
+        the length given by `sequence_length`.
 
     Returns:
       A tf.data.Dataset.
@@ -1218,8 +1221,8 @@ class Task(DatasetProviderBase):
     ds = self.preprocess_postcache(
         ds, sequence_length=sequence_length, seed=seed)
     ds = self._validate_preprocessing(ds)
-    ds = self._trim_output_features(ds, sequence_length=sequence_length)
-
+    if trim_output_features:
+      ds = self._trim_output_features(ds, sequence_length=sequence_length)
     if shuffle:
       if self._shuffle_buffer_size is None:
         raise ValueError(
@@ -1410,7 +1413,9 @@ class Mixture(DatasetProviderBase):
       num_epochs: Optional[int] = None,
       copy_pretokenized: bool = False,
       compute_stats_empirically: bool = False,
-      passthrough_features: Optional[Sequence[str]] = None) -> tf.data.Dataset:
+      log_mixing_proportions: bool = True,
+      passthrough_features: Optional[Sequence[str]] = None,
+      trim_output_features: bool = True) -> tf.data.Dataset:
     """Returns the dataset of mixed tasks using the object-specified rates.
 
     Args:
@@ -1432,9 +1437,12 @@ class Mixture(DatasetProviderBase):
       copy_pretokenized: bool, whether to pass through copies of pretokenized
         features a "_pretokenized" suffix added to the key.
       compute_stats_empirically: a boolean - does not work on TPU
+      log_mixing_proportions: whether to log the mixing porportions of the tasks
       passthrough_features: a list of additional features that will be kept
         after the feature filtering. If set to be None, then only the
         output_features defined for the mixture will be kept.
+      trim_output_features: If True, it trims output features to be less than
+        the length given by `sequence_length`.
     """
     self._check_compatible_features()
     tasks = []
@@ -1466,7 +1474,8 @@ class Mixture(DatasetProviderBase):
             shuffle=shuffle,
             seed=seed,
             shard_info=shard_info,
-            num_epochs=num_epochs).map(
+            num_epochs=num_epochs,
+            trim_output_features=trim_output_features).map(
                 filter_features,
                 num_parallel_calls=tf.data.experimental.AUTOTUNE)
         for task in tasks
@@ -1480,7 +1489,7 @@ class Mixture(DatasetProviderBase):
     else:
       sample_seed = 42
     dataset = self._sample_fn(datasets, rates, sample_seed)
-    if (split == "train" and use_cached and
+    if (log_mixing_proportions and split == "train" and use_cached and
         all(t.supports_caching for t in tasks)):
       _log_mixing_proportions(tasks, datasets, rates, dataset, sequence_length,
                               compute_stats_empirically)
@@ -1628,7 +1637,8 @@ def get_dataset(mixture_or_task_name: str,
                 num_epochs: Optional[int] = 1,
                 shard_info: Optional[ShardInfo] = None,
                 verbose: bool = True,
-                seed: Optional[int] = None) -> tf.data.Dataset:
+                seed: Optional[int] = None,
+                trim_output_features: bool = True) -> tf.data.Dataset:
   """Get processed dataset with the model features.
 
   In order to use options specific to a feature converter, e.g., packing,
@@ -1658,6 +1668,8 @@ def get_dataset(mixture_or_task_name: str,
     shard_info: number of shards and shard index information.
     verbose: if true, log the feature shapes.
     seed: a random seed to for shuffling tf.data.
+    trim_output_features: If True, it trims output features to be less than
+        the length given by `sequence_length`.
 
   Returns:
     ds: the processed dataset.
@@ -1675,9 +1687,12 @@ def get_dataset(mixture_or_task_name: str,
       shuffle=shuffle,
       seed=seed,
       shard_info=shard_info,
-      num_epochs=num_epochs)
+      num_epochs=num_epochs,
+      trim_output_features=trim_output_features)
 
-  ds = feature_converter(ds, task_feature_lengths=task_feature_lengths)
+  ds = feature_converter(
+      ds,
+      task_feature_lengths=task_feature_lengths)
 
   if verbose:
     logging.info(
