@@ -157,7 +157,7 @@ def translate(dataset: tf.data.Dataset,
       'targets': 'That is good.'}
 
     Args:
-      x: an example to process.
+      ex: an example to process.
       source_language: source language code (e.g. 'en') to translate from.
       target_language: target language code (e.g. 'de') to translate to.
 
@@ -209,7 +209,7 @@ A few **important** notes:
       'targets': 'That is good.'}
 
     Args:
-      x: an example to process.
+      ex: an example to process.
       source_language: source language code (e.g. 'en') to translate from.
       target_language: target language code (e.g. 'de') to translate to.
 
@@ -417,9 +417,9 @@ The first step to doing so is to add a `seqio.CacheDatasetPlaceholder(required=F
 Caveats:
 
 * Any stochastic operations that you wish to be re-run when `num_epochs > 1` or with a different `seed` *should* go after the placeholder since only a single sample will be cached.
-* Any preprocessing steps that use the `sequence_length` argument *must* come after the `seqio.CacheDatasetPlaceholder` preproessor since this is only known at runtime, or an exception will be raised. If you wish to cache for a specific sequence length, you can use [`seqio.experimental.add_fully_cached_task`](https://github.com/google/seqio/tree/main/seqio/experimental.py).
+* Any preprocessing steps that use the `sequence_length` argument *must* come after the `seqio.CacheDatasetPlaceholder` preprocessor since this is only known at runtime, or an exception will be raised. If you wish to cache for a specific sequence length, you can use [`seqio.experimental.add_fully_cached_task`](https://github.com/google/seqio/tree/main/seqio/experimental.py).
 
-Once your `Task` is registered, you can run [`cache_tasks_main`](scripts/cache_tasks_main.py) to execute the offline preprocessing, providing it with the module containing your task definitions via the `--module_import` flag. For very large datasets, it's recommended you run this [Apache Beam](https://beam.apache.org/) script on a distributed framework like [Google Cloud DataFlow](https://beam.apache.org/documentation/runners/dataflow/).
+Once your `Task` is registered, you can run [`cache_tasks_main`](https://github.com/google/seqio/tree/main/seqio/scripts/cache_tasks_main.py) to execute the offline preprocessing, providing it with the module containing your task definitions via the `--module_import` flag. For very large datasets, it's recommended you run this [Apache Beam](https://beam.apache.org/) script on a distributed framework like [Google Cloud DataFlow](https://beam.apache.org/documentation/runners/dataflow/).
 
 Finally, you are ready to load the cached version of your `Task` (or `Mixture`) containing it. You will need to add the path to the directory you passed to `--output_cache_dir` via `seqio.add_global_cache_dirs(["/my/cache/dir"])`. Now when you call `task_or_mixture.get_dataset(..., use_cached=True)`, the data will be loaded from the cache directory instead of the raw data source.
 
@@ -856,7 +856,7 @@ In this example, we are using the `TfdsDataSource`. We specify the name of the T
 The preprocessor `tqa_open_preprocessor` is defined as follows.
 
 ```py
-def trivia_qa_open(
+def tqa_open_preprocessor(
     dataset: tf.data.Dataset,
     prefix:str = "trivia_qa question: "
   ) -> tf.data.Dataset:
@@ -891,7 +891,7 @@ def trivia_qa_open(
 Or with the `seqio.map_overdataset` decorator, we have
 
 ```py
-def trivia_qa_open(
+def tqa_open_preprocessor(
   dataset: tf.data.Dataset,
   prefix: str = "trivia_qa question: "
 ) -> tf.data.Dataset:

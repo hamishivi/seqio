@@ -17,7 +17,7 @@
 
 import concurrent
 import functools
-from typing import Callable, Sequence, Mapping, Optional, Tuple
+from typing import Any, Callable, Sequence, Mapping, Optional, Tuple
 from unittest import mock
 
 import numpy as np
@@ -69,6 +69,16 @@ def _sum_scores_metric(targets, scores):
   return {"total_score": (np.array(scores) * np.array(weights)).sum()}
 
 
+def _sum_scores_metric_with_intermediates(targets, scores):
+  _, intermediates = scores
+  scores = intermediates["score"]
+  weights = [sum(ord(c) for c in t) for t in targets]
+  return {
+      "total_score_with_intermediates":
+          (np.array(scores) * np.array(weights)).sum()
+  }
+
+
 def register_dummy_task(task_name: str,
                         dataset_fn: Callable[[str, bool, Optional[int]],
                                              tf.data.Dataset],
@@ -108,6 +118,10 @@ def get_mocked_task(name: str = "mocked_test",
       list(predict_with_aux_metric_fns))
   # Identity postprocess function
   task.postprocess_fn = lambda d, example, is_target: d
+  task.metric_objs = [
+      metrics_lib.LegacyMetric.empty(mf, task.postprocess_fn)
+      for mf in task.metric_fns
+  ]
 
   mock_vocab = mock.Mock()
   task.output_features = {
@@ -158,7 +172,8 @@ class EvaluationTest(tf.test.TestCase):
         raise AssertionError(str(e) + " for key '%s'" % k)
 
   def test_get_valid_eval_tasks(self):
-    task_no_metrics = mock.Mock(splits=("train", "validation"), metric_fns=[])
+    task_no_metrics = mock.Mock(splits=("train", "validation"), metric_fns=[],
+                                metric_objs=[])
     task_no_split = mock.Mock(splits=("train"), metric_fns=[lambda x: x])
     valid_task = mock.Mock(
         splits=("train", "validation"), metric_fns=[lambda x: x])
@@ -482,7 +497,8 @@ class EvaluationTest(tf.test.TestCase):
       return {"fake_result": result}
 
     task = get_mocked_task(
-        predict_with_aux_metric_fns=[_aux_metric_that_cares_about_order])
+        predict_with_aux_metric_fns=[_aux_metric_that_cares_about_order],
+        predict_metric_fns=[])
 
     id_to_vocab = {5: "5", 6: "6", 7: "7"}
     mock_vocab = task.output_features["targets"].vocabulary
@@ -1055,11 +1071,11 @@ class EvaluationTest(tf.test.TestCase):
           predict_fn=mixing_order_predict_fn,
           score_fn=self.uncalled_fn)
       expected_metric = {"sequence_accuracy": 100}
-      expected_outputs = (
+      expected_outputs = [
           np.array([5], dtype=np.int32),
           np.array([6], dtype=np.int32),
           np.array([7], dtype=np.int32),
-      )
+      ]
       self.assertDictEqual(expected_metric, all_metrics.result()[task.name])
       self.assertEqual(expected_outputs, all_outputs[task.name])
 
@@ -1079,7 +1095,7 @@ class EvaluationTest(tf.test.TestCase):
 
     task = get_mocked_task(
         predict_metric_fns=[_accuracy_metric],
-        score_metric_fns=[lambda *_: {
+        score_metric_fns=[lambda targets, scores: {
             "accuracy": 0
         }])
     with self.assertRaisesWithLiteralMatch(
@@ -1141,6 +1157,46 @@ class EvaluationTest(tf.test.TestCase):
     self.assertSequenceEqual(evaluator.cached_targets[task_name], ["ex 1"])
     task.output_features["targets"].vocabulary.decode.assert_called_once_with(
         [42, 48, 1])
+
+  def test_task_with_score_fn_with_intermediates(self):
+
+    def score_fn_with_intermediates(
+        ds: tf.data.Dataset,
+        model_feature_shapes: Optional[Mapping[str, int]] = None
+    ) -> Tuple[Sequence[Tuple[int, float]], Sequence[Mapping[str, Any]]]:
+      del ds, model_feature_shapes
+      indices_and_scores = [(1, 1), (0, 2), (2, 3)]
+      intermediates = {"score": [101, 102, 103]}
+      return indices_and_scores, intermediates
+
+    task = get_mocked_task(
+        predict_metric_fns=[],
+        score_metric_fns=[_sum_scores_metric_with_intermediates])
+
+    def mock_init(self):
+      self._cached_model_datasets = {task.name: tf.data.Dataset.range(1, 4)}
+      self._cached_task_datasets = {task.name: tf.data.Dataset.range(3)}
+      self._cached_targets = {task.name: ["e5 e6", "e6", "e7"]}
+      self._eval_tasks = [task]
+      self._loggers = ()
+      self._metrics_future = None
+      self._metrics_executor = concurrent.futures.ThreadPoolExecutor(
+          max_workers=1)
+      self._target_field_name = "targets"
+
+    with mock.patch.object(Evaluator, "__init__", new=mock_init):
+      evaluator = Evaluator()  # pytype: disable=missing-parameter
+
+      all_metrics, _, _ = evaluator.evaluate(
+          compute_metrics=True,
+          predict_fn=self.uncalled_fn,
+          predict_with_aux_fn=self.uncalled_fn,
+          score_fn=score_fn_with_intermediates,
+          step=42)
+      results = all_metrics.result()
+
+    self.assertDictClose({"total_score_with_intermediates": 66505},
+                         results["mocked_test"])
 
 
 if __name__ == "__main__":

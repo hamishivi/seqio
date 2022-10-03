@@ -134,12 +134,9 @@ class PreprocessTask(beam.PTransform):
       yield ex
 
   def expand(self, pipeline):
-    # The Reshuffles allow for better parallelism.
     return (pipeline
             | "create_shards" >> beam.Create(self.shards)
-            | "shard_reshuffle" >> beam.Reshuffle()
-            | "emit_examples" >> beam.FlatMap(self._emit_examples)
-            | "example_reshuffle" >> beam.Reshuffle())
+            | "emit_examples" >> beam.FlatMap(self._emit_examples))
 
 
 class WriteExampleTfRecord(beam.PTransform):
@@ -336,7 +333,7 @@ class _CountCharacters(beam.DoFn):
           ex[name].dtype in (np.int32, np.int64) and feat.rank == 1 and
           isinstance(feat.vocabulary, seqio.SentencePieceVocabulary)):
         value = ex[name]
-        value = value.astype(np.int32)
+        value = np.abs(value.astype(np.int32))
         decoded = feat.vocabulary.decode_tf(value).numpy().decode("utf-8")
 
       # If each example in the dataset has the type tf.string, its type
@@ -361,8 +358,11 @@ class GetStats(beam.PTransform):
   prefixed by the identifiers.
   """
 
-  def __init__(self, output_features: Mapping[str, seqio.Feature]):
+  def __init__(self,
+               output_features: Mapping[str, seqio.Feature],
+               task_ids: Optional[Mapping[str, Any]] = None):
     self._output_features = output_features
+    self._task_ids = task_ids or {}
 
   def expand(self, pcoll):
     example_counts = (
@@ -398,6 +398,17 @@ class GetStats(beam.PTransform):
         merged_dict.update(d)
       return merged_dict
 
-    return ([example_counts, total_tokens, max_tokens, char_length]
+    stats = [example_counts, total_tokens, max_tokens, char_length]
+    if self._task_ids:
+      # ids could be Tensors, cast to int.
+      self._task_ids = {k: int(v) for k, v in self._task_ids.items()}
+      task_ids_dict = {"task_ids": self._task_ids}
+      task_ids = (
+          pcoll
+          | "sample_for_task_ids" >> beam.combiners.Sample.FixedSizeGlobally(1)
+          | "create_task_ids" >> beam.Map(lambda _: task_ids_dict))
+      stats.append(task_ids)
+
+    return (stats
             | "flatten_counts" >> beam.Flatten()
             | "merge_stats" >> beam.CombineGlobally(_merge_dicts))

@@ -42,6 +42,9 @@ setuptools.setup(
     scripts=[],
     install_requires=[
         'absl-py',
+        'clu',
+        'jax',
+        'jaxlib',
         'numpy',
         'packaging',
         'sentencepiece',

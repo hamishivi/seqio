@@ -538,6 +538,28 @@ class EncDecFeatureConverter(FeatureConverter):
       "decoder_positions": tf.int32
   }
 
+  def _convert_example(
+      self, features: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
+    """Convert a seq2seq example into an example with model features."""
+    # targets_segment_id is present only for a packed dataset.
+    decoder_input_tokens = utils.make_autoregressive_inputs(
+        features["targets"],
+        sequence_id=features.get("targets_segment_ids", None))
+
+    d = {"encoder_input_tokens": features["inputs"],
+         "decoder_target_tokens": features["targets"],
+         "decoder_input_tokens": decoder_input_tokens,
+         # Loss is computed for all but the padding positions.
+         "decoder_loss_weights": non_padding_position(features["targets"])}
+
+    if self.pack:
+      d["encoder_segment_ids"] = features["inputs_segment_ids"]
+      d["decoder_segment_ids"] = features["targets_segment_ids"]
+      d["encoder_positions"] = features["inputs_positions"]
+      d["decoder_positions"] = features["targets_positions"]
+
+    return d
+
   def _convert_features(
       self, ds: tf.data.Dataset,
       task_feature_lengths: Mapping[str, int]) -> tf.data.Dataset:
@@ -563,31 +585,9 @@ class EncDecFeatureConverter(FeatureConverter):
     Returns:
       ds: the converted dataset.
     """
-
-    def convert_example(
-        features: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
-      # targets_segment_id is present only for a packed dataset.
-      decoder_input_tokens = utils.make_autoregressive_inputs(
-          features["targets"],
-          sequence_id=features.get("targets_segment_ids", None))
-
-      d = {"encoder_input_tokens": features["inputs"],
-           "decoder_target_tokens": features["targets"],
-           "decoder_input_tokens": decoder_input_tokens,
-           # Loss is computed for all but the padding positions.
-           "decoder_loss_weights": non_padding_position(features["targets"])}
-
-      if self.pack:
-        d["encoder_segment_ids"] = features["inputs_segment_ids"]
-        d["decoder_segment_ids"] = features["targets_segment_ids"]
-        d["encoder_positions"] = features["inputs_positions"]
-        d["decoder_positions"] = features["targets_positions"]
-
-      return d
-
     ds = self._pack_or_pad(ds, task_feature_lengths)
     return ds.map(
-        convert_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        self._convert_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
   def get_model_feature_lengths(
       self, task_feature_lengths: Mapping[str, int]) -> Mapping[str, int]:
@@ -969,6 +969,39 @@ class PrefixLMFeatureConverter(LMFeatureConverter):
 
     return d
 
+  def _concat_and_add_masks(self, features: tf.data.Dataset) -> tf.data.Dataset:
+    """Creates concatenated inputs and targets fields and adds masks."""
+    inputs = features["inputs"]
+    targets = features["targets"]
+    # If the targets are empty, we add one padding target.
+    targets = tf.cond(
+        tf.size(targets) > 0, lambda: targets,
+        lambda: tf.zeros(1, dtype="int32"))
+
+    # Width of the "inputs" portion in the concatenated sequence.
+    width = tf.size(inputs)
+    inputs_width = tf.fill([tf.size(inputs) + tf.size(targets)], width)
+
+    # Width with an extra position to the right in the inputs mask. See
+    # docstring for details.
+    inputs_width_add_pos = tf.fill([tf.size(inputs) + tf.size(targets)],
+                                   width + 1)
+
+    return {
+        "targets": tf.concat([inputs, targets], axis=-1),
+        "inputs_width": inputs_width,
+        "inputs_width_add_pos": inputs_width_add_pos
+    }
+
+  def _concat_task_feature_lengths(
+      self, task_feature_lengths: Mapping[str, int]) -> Mapping[str, int]:
+    concat_length = sum(task_feature_lengths.values())
+    return {
+        "targets": concat_length,
+        "inputs_width": concat_length,
+        "inputs_width_add_pos": concat_length
+    }
+
   def _convert_features(
       self, ds: tf.data.Dataset,
       task_feature_lengths: Mapping[str, int]) -> tf.data.Dataset:
@@ -990,38 +1023,12 @@ class PrefixLMFeatureConverter(LMFeatureConverter):
     Returns:
       ds: the converted dataset.
     """
-    def concat_and_add_masks(features):
-      inputs = features["inputs"]
-      targets = features["targets"]
-      # If the targets are empty, we add one padding target.
-      targets = tf.cond(
-          tf.size(targets) > 0, lambda: targets,
-          lambda: tf.zeros(1, dtype="int32"))
-
-      # Width of the "inputs" portion in the concatenated sequence.
-      width = tf.size(inputs)
-      inputs_width = tf.fill([tf.size(inputs) + tf.size(targets)], width)
-
-      # Width with an extra position to the right in the inputs mask. See
-      # docstring for details.
-      inputs_width_add_pos = tf.fill([tf.size(inputs) + tf.size(targets)],
-                                     width + 1)
-
-      return {
-          "targets": tf.concat([inputs, targets], axis=-1),
-          "inputs_width": inputs_width,
-          "inputs_width_add_pos": inputs_width_add_pos
-      }
-
     ds = ds.map(
-        concat_and_add_masks, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        self._concat_and_add_masks,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
-    concat_length = sum(task_feature_lengths.values())
-    concat_task_feature_lengths = {
-        "targets": concat_length,
-        "inputs_width": concat_length,
-        "inputs_width_add_pos": concat_length
-    }
+    concat_task_feature_lengths = self._concat_task_feature_lengths(
+        task_feature_lengths)
 
     ds = self._pack_or_pad(ds, concat_task_feature_lengths)
     return ds.map(

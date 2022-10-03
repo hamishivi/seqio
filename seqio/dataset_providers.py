@@ -25,9 +25,10 @@ import inspect
 import json
 import os
 import re
-from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, Type, Union, List
 
 from absl import logging
+import clu.metrics
 import numpy as np
 from packaging import version
 from seqio import metrics as metrics_lib
@@ -47,16 +48,7 @@ SHUFFLE_BUFFER_SIZE = 1000
 
 DatasetReaderType = Callable[[Union[str, Iterable[str]]], tf.data.Dataset]
 DecodeFnType = Callable[..., Mapping[str, tf.train.Feature]]
-
-
-@dataclasses.dataclass(frozen=True)
-class Feature:
-  """A container for attributes of output features of data providers."""
-  vocabulary: Vocabulary
-  add_eos: bool = True
-  required: bool = True
-  dtype: tf.DType = tf.int32
-  rank: int = 1
+Feature = utils.Feature
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,7 +122,7 @@ class DatasetProviderRegistry(object):
       raise ValueError("Attempting to register a class of an invalid type. "
                        "Expecting instance of %s, got %s" %
                        (cls._PROVIDER_TYPE, provider_cls))
-    provider = provider_cls(*provider_args, **provider_kwargs)
+    provider = provider_cls(*provider_args, **provider_kwargs)  # pytype: disable=wrong-arg-types  # dynamic-method-lookup
     cls.add_provider(name, provider)
     return provider
 
@@ -322,7 +314,12 @@ class DatasetFnCallable(typing_extensions.Protocol):
 
 
 class FunctionDataSource(DataSource):
-  """A `DataSource` that uses a function to provide the input data."""
+  """A `DataSource` that uses a function to provide the input data.
+
+  This source is not recommended when shuffling is required unless it is
+  cached/materialized in advance. Using this source without caching for training
+  will result in insufficient shuffling and lead to repeated data on restarts.
+  """
 
   def __init__(self,
                dataset_fn: DatasetFnCallable,
@@ -364,6 +361,14 @@ class FunctionDataSource(DataSource):
       raise ValueError(
           "`FunctionDataSource` does not support low-level sharding. Use "
           "tf.data.Dataset.shard instead.")
+
+    if shuffle:
+      logging.warning(
+          "Using an uncached FunctionDataset for training is not recommended "
+          "since it often results in insufficient shuffling on restarts, "
+          "resulting in overfitting. It is highly recommended that you cache "
+          "this task before training with it or use a data source that "
+          "supports lower-level shuffling (e.g., FileDataSource).")
 
     if seed is None:
       ds = self._dataset_fn(split=split, shuffle_files=shuffle)
@@ -778,8 +783,7 @@ class CacheDatasetPlaceholder(object):
 
 # ================================ Tasks =======================================
 
-MetricFnCallable = Callable[..., Mapping[str, Union[metrics_lib.MetricValue,
-                                                    float]]]
+MetricFnCallable = metrics_lib.MetricFnCallable
 
 
 class Task(DatasetProviderBase):
@@ -793,6 +797,7 @@ class Task(DatasetProviderBase):
       preprocessors: Optional[Sequence[Callable[..., tf.data.Dataset]]] = None,
       postprocess_fn: Optional[Callable[..., Any]] = None,
       metric_fns: Optional[Sequence[MetricFnCallable]] = None,
+      metric_objs: Optional[Sequence[clu.metrics.Metric]] = None,
       shuffle_buffer_size: Optional[int] = SHUFFLE_BUFFER_SIZE):
     """Task constructor.
 
@@ -819,6 +824,9 @@ class Task(DatasetProviderBase):
         - (targets, predictions, aux_values) - Note that
             `aux_values` refers to a dictionary of auxiliary values that the
             model assigned to each sequence.
+        metric_fns are being deprecated, please use metric_objs instead.
+      metric_objs: list(clu Metric instances), an optional list of clu Metric
+        objects.
       shuffle_buffer_size: an optional integer to set the shuffle buffer size.
         If None, shuffling will be disallowed.
     """
@@ -826,8 +834,15 @@ class Task(DatasetProviderBase):
       raise ValueError(
           "Task name '%s' contains invalid characters. Must match regex: %s" %
           (name, _VALID_TASK_NAME_REGEX.pattern))
-
+    # Convert metric_fns into metric_objs for backward compatibility.
     metric_fns = metric_fns or []
+    metric_objs = metric_objs or []
+    if metric_fns:
+      metric_objs += [
+          metrics_lib.LegacyMetric.empty(mf, postprocess_fn)
+          for mf in metric_fns
+      ]
+    self._metric_objs = metric_objs
     self._predict_metric_fns = []
     self._predict_with_aux_metric_fns = []
     self._score_metric_fns = []
@@ -897,6 +912,11 @@ class Task(DatasetProviderBase):
   @property
   def name(self) -> str:
     return self._name
+
+  @property
+  def metric_objs(self) -> Sequence[clu.metrics.Metric]:
+    """List of all metric objects."""
+    return self._metric_objs
 
   @property
   def metric_fns(self) -> Sequence[MetricFnCallable]:
@@ -1001,22 +1021,7 @@ class Task(DatasetProviderBase):
       sequence_length: Optional[Mapping[str, Union[int, Sequence[int]]]]
   ) -> tf.data.Dataset:
     """Trim output features to sequence length."""
-
-    def _trim(k: str, v: tf.Tensor) -> tf.Tensor:
-      if (k not in self.output_features or not sequence_length or
-          k not in sequence_length or sequence_length[k] is None):
-        return v
-      # Unify lengths into an iterable so we can create a slice for each
-      # dimension, even if the length is a single int.
-      lengths = sequence_length[k]
-      if isinstance(lengths, int):
-        lengths = [lengths]
-      slices = tuple((slice(0, limit) for limit in lengths))
-      return v[slices]
-
-    return dataset.map(
-        lambda ex: {k: _trim(k, v) for k, v in ex.items()},
-        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    return utils.trim_dataset(dataset, sequence_length, self.output_features)
 
   def preprocess_precache(self,
                           dataset: tf.data.Dataset,
@@ -1267,10 +1272,11 @@ class TaskRegistry(DatasetProviderRegistry):
                                                     tf.data.Dataset]]] = None,
           postprocess_fn: Optional[Callable[..., Any]] = None,
           metric_fns: Optional[Sequence[MetricFnCallable]] = None,
+          metric_objs: Optional[Sequence[clu.metrics.Metric]] = None,
           **kwargs) -> Task:
     """See `Task` constructor for docstring."""
     return super().add(name, Task, name, source, output_features, preprocessors,
-                       postprocess_fn, metric_fns, **kwargs)
+                       postprocess_fn, metric_fns, metric_objs, **kwargs)
 
   @classmethod
   def get(cls, name) -> Task:
@@ -1402,7 +1408,7 @@ class Mixture(DatasetProviderBase):
           raise ValueError(
               "Features across tasks in a mixture must use the same dtype.")
 
-  def get_dataset(
+  def get_dataset(  # pytype: disable=signature-mismatch  # overriding-parameter-type-checks
       self,
       sequence_length: Optional[Mapping[str, int]],
       split: str = tfds.Split.TRAIN,
@@ -1466,8 +1472,10 @@ class Mixture(DatasetProviderBase):
     def filter_features(ex):
       return {k: v for k, v in ex.items() if k in output_feature_keys}
 
-    datasets = [
-        task.get_dataset(  # pylint:disable=g-complex-comprehension
+    datasets: List[tf.data.Dataset] = []
+    for task in tasks:
+      try:
+        ds = task.get_dataset(
             sequence_length,
             split=split,
             use_cached=use_cached,
@@ -1478,8 +1486,13 @@ class Mixture(DatasetProviderBase):
             trim_output_features=trim_output_features).map(
                 filter_features,
                 num_parallel_calls=tf.data.experimental.AUTOTUNE)
-        for task in tasks
-    ]
+        datasets.append(ds)
+      except:
+        logging.error("Failed to load task '%s' as part of mixture '%s'",
+                      task.name, self.name)
+        # Re-raise the same exception, same stack-trace.
+        raise
+
     rates = [self.get_rate(task) for task in tasks]
     # Sample from the dataset with the rates rates
     if seed is not None:
@@ -1615,9 +1628,12 @@ def get_mixture_or_task(task_or_mixture_name):
   if task_or_mixture_name in tasks:
     return TaskRegistry.get(task_or_mixture_name)
   else:
+    for available_task in sorted(tasks):
+      logging.info("Available task: %s", available_task)
+    for available_mixture in sorted(mixtures):
+      logging.info("Available mixture: %s", available_mixture)
     raise ValueError(
-        "No Task or Mixture found with name '%s'. Available:\n - %s" %
-        (task_or_mixture_name, "\n - ".join(sorted(mixtures) + sorted(tasks))))
+        "No Task or Mixture found with name '%s'." % task_or_mixture_name)
 
 
 def get_subtasks(task_or_mixture):
