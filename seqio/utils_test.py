@@ -13,7 +13,9 @@
 # limitations under the License.
 
 """Tests for seqio.utils."""
-from typing import Mapping, Sequence
+import dataclasses
+import functools
+from typing import Mapping, Optional, Sequence
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -119,6 +121,31 @@ class LazyTfdsLoaderTest(absltest.TestCase):
     self.assertListEqual(["f3"], ds.files(split="validation"))
     with self.assertRaises(KeyError):
       ds.files(split="test")
+
+
+class TransformUtilsTest(parameterized.TestCase):
+
+  def test_add_kwargs_to_transform_callable(self):
+
+    def fn(x, y):
+      return x * y
+
+    fn = utils.add_kwargs_to_transform(fn, y=2, z=10)
+    self.assertEqual(6, fn(3))
+
+  def test_add_kwargs_to_transform_dataclass(self):
+
+    @dataclasses.dataclass
+    class Fn:
+      factor: int
+      y: Optional[int] = None
+
+      def __call__(self, x):
+        return self.factor * self.y * x
+
+    fn = Fn(10)
+    fn = utils.add_kwargs_to_transform(fn, y=2, z=10)
+    self.assertEqual(60, fn(3))
 
 
 class UtilsTest(parameterized.TestCase, tf.test.TestCase):
@@ -398,14 +425,65 @@ class UtilsTest(parameterized.TestCase, tf.test.TestCase):
     np.testing.assert_array_equal(
         utils.stateless_shuffle(value, (2, 3)), expected_output_2)
 
-  def test_map_over_dataset(self):
-    inputs = tf.data.Dataset.range(5)
+  @parameterized.parameters(utils.map_over_dataset,
+                            utils.map_over_dataset(num_parallel_calls=2))
+  def test_map_over_dataset_as_decorator(self, decorator):
 
-    @utils.map_over_dataset
-    def test_fn(x):
-      return x + 1
+    @decorator
+    def square(x):
+      return x**2
 
-    self.assertEqual(list(test_fn(inputs).as_numpy_iterator()), [1, 2, 3, 4, 5])
+    ds = square(tf.data.Dataset.range(4))
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
+
+  def test_map_over_dataset_as_decorator_with_seeds(self):
+
+    @utils.map_over_dataset(num_seeds=2)
+    def square(x, seeds):
+      del seeds
+      return x**2
+
+    ds = square(tf.data.Dataset.range(4))  # pylint: disable=no-value-for-parameter
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
+
+  @parameterized.parameters({}, {"num_parallel_calls": 2})
+  def test_map_over_dataset_as_function(self, **kwargs):
+
+    def square(x):
+      return x**2
+
+    square = utils.map_over_dataset(square, **kwargs)
+    ds = square(tf.data.Dataset.range(4))
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
+
+  def test_map_over_dataset_as_function_with_seeds(self):
+
+    def square(x, seeds):
+      del seeds
+      return x**2
+
+    square = utils.map_over_dataset(square, num_seeds=2)
+    ds = square(tf.data.Dataset.range(4))
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
+
+  def test_map_over_dataset_as_partial_function(self):
+
+    @functools.partial(utils.map_over_dataset, num_parallel_calls=2)
+    def square(x):
+      return x**2
+
+    ds = square(tf.data.Dataset.range(4))
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
+
+  def test_map_over_dataset_as_partial_function_with_seeds(self):
+
+    @functools.partial(utils.map_over_dataset, num_seeds=2)
+    def square(x, seeds):
+      del seeds
+      return x**2
+
+    ds = square(tf.data.Dataset.range(4))  # pylint: disable=no-value-for-parameter
+    self.assertEqual(list(ds.as_numpy_iterator()), [0, 1, 4, 9])
 
   # We disable no-value-for-parameter since the utils.map_over_dataset leads to
   # a false positive when seeds are provided.
