@@ -32,6 +32,7 @@ import clu.metrics
 import numpy as np
 from packaging import version
 from seqio import metrics as metrics_lib
+from seqio import preprocessors as seqio_preprocessors
 from seqio import utils
 from seqio.feature_converters import FeatureConverter
 from seqio.vocabularies import PassThroughVocabulary
@@ -116,13 +117,13 @@ class DatasetProviderRegistry(object):
     cls._REGISTRY[name] = provider
 
   @classmethod
-  def add(cls, name: str, provider_cls, *provider_args, **provider_kwargs):
+  def add(cls, name: str, provider_cls, provider_kwargs):
     """Instantiates and adds provider to the registry."""
     if not issubclass(provider_cls, cls._PROVIDER_TYPE):
       raise ValueError("Attempting to register a class of an invalid type. "
                        "Expecting instance of %s, got %s" %
                        (cls._PROVIDER_TYPE, provider_cls))
-    provider = provider_cls(*provider_args, **provider_kwargs)  # pytype: disable=wrong-arg-types  # dynamic-method-lookup
+    provider = provider_cls(**provider_kwargs)  # pytype: disable=wrong-arg-types  # dynamic-method-lookup
     cls.add_provider(name, provider)
     return provider
 
@@ -394,10 +395,12 @@ class TfdsDataSource(DataSource):
     """TfdsTask constructor.
 
     Args:
-      tfds_name: string, the name and version number of a TFDS dataset,
+      tfds_name: The name and version number of a TFDS dataset,
         optionally with a config.
-      tfds_data_dir: string, an optional path to a specific TFDS data directory
-        to use.
+      tfds_data_dir: An optional path to a specific TFDS data directory to use.
+        If provided `tfds_name` must be a valid dataset in the directory.
+        If `tfds_name` is empty `tfds_dara_dir` must point to the directory with
+        one dataset.
       splits: an iterable of allowable string split names, a dict mapping
         allowable canonical splits (e.g., 'validation') to TFDS splits or slices
         (e.g., 'train[':1%']), or None. The default, None, uses all available
@@ -407,9 +410,9 @@ class TfdsDataSource(DataSource):
       decoders: dict (optional), mapping from features to tfds.decode.Decoders,
         such as tfds.decode.SkipDecoding() for skipping image byte decoding
     """
-    if ":" not in tfds_name:
-      raise ValueError("TFDS name must contain a version number, got: %s" %
-                       tfds_name)
+    if tfds_name and ":" not in tfds_name:
+      raise ValueError(
+          f"TFDS name must contain a version number, got: {tfds_name}")
 
     if splits and not isinstance(splits, dict):
       splits = {k: k for k in splits}
@@ -972,14 +975,11 @@ class Task(DatasetProviderBase):
       sequence_length: Optional[Mapping[str, int]] = None) -> tf.data.Dataset:
     """Sequentially applies preprocessors."""
     for prep_fn in preprocessors:
-      # prep_fn must not rely on variable length keyword args such as **kwargs.
-      fn_args = set(inspect.signature(prep_fn).parameters.keys())
-      kwargs = {}
-      if "sequence_length" in fn_args:
-        kwargs["sequence_length"] = sequence_length
-      if "output_features" in fn_args:
-        kwargs["output_features"] = self.output_features
-      dataset = prep_fn(dataset, **kwargs)
+      prep_fn = utils.add_kwargs_to_transform(
+          prep_fn,
+          sequence_length=sequence_length,
+          output_features=self.output_features)
+      dataset = prep_fn(dataset)
     return dataset
 
   def _validate_preprocessing(self,
@@ -1258,11 +1258,13 @@ class Task(DatasetProviderBase):
     return decoded_model_output
 
 
+
 class TaskRegistry(DatasetProviderRegistry):
   """Registry of Tasks."""
   _REGISTRY = {}
   _PROVIDER_TYPE = Task
 
+  # pylint: disable=arguments-renamed
   @classmethod
   def add(cls,
           name: str,
@@ -1273,10 +1275,23 @@ class TaskRegistry(DatasetProviderRegistry):
           postprocess_fn: Optional[Callable[..., Any]] = None,
           metric_fns: Optional[Sequence[MetricFnCallable]] = None,
           metric_objs: Optional[Sequence[clu.metrics.Metric]] = None,
+          task_cls: Type[Task] = Task,
           **kwargs) -> Task:
     """See `Task` constructor for docstring."""
-    return super().add(name, Task, name, source, output_features, preprocessors,
-                       postprocess_fn, metric_fns, metric_objs, **kwargs)
+    provider_kwargs = {
+        "name": name,
+        "source": source,
+        "output_features": output_features,
+        "preprocessors": preprocessors,
+        "postprocess_fn": postprocess_fn,
+        "metric_fns": metric_fns,
+        "metric_objs": metric_objs,
+        **kwargs,
+    }
+    return super().add(
+        name, provider_cls=task_cls, provider_kwargs=provider_kwargs)
+
+  # pylint: enable=arguments-renamed
 
   @classmethod
   def get(cls, name) -> Task:
@@ -1509,6 +1524,8 @@ class Mixture(DatasetProviderBase):
     return dataset
 
 
+
+
 def _log_padding_fractions(dataset, sequence_length, num_examples=100):
   """Empirically compute the fraction of padding - log the results.
 
@@ -1606,14 +1623,28 @@ class MixtureRegistry(DatasetProviderRegistry):
   _REGISTRY = {}
   _PROVIDER_TYPE = Mixture
 
+  # pylint: disable=arguments-renamed
   @classmethod
-  def add(cls, name, tasks, default_rate=None, **kwargs) -> Mixture:
+  def add(cls,
+          name,
+          tasks,
+          default_rate=None,
+          mixture_cls: Type[Mixture] = Mixture,
+          **kwargs) -> Mixture:
     """See `Mixture` constructor for docstring."""
-    return super().add(name, Mixture, name, tasks, default_rate, **kwargs)
+    provider_kwargs = {
+        "name": name,
+        "tasks": tasks,
+        "default_rate": default_rate,
+        **kwargs,
+    }
+    return super().add(
+        name, provider_cls=mixture_cls, provider_kwargs=provider_kwargs)
 
   @classmethod
   def get(cls, name) -> Mixture:
     return super().get(name)
+  # pylint: enable=arguments-renamed
 
 
 def get_mixture_or_task(task_or_mixture_name):
@@ -1654,6 +1685,7 @@ def get_dataset(mixture_or_task_name: str,
                 shard_info: Optional[ShardInfo] = None,
                 verbose: bool = True,
                 seed: Optional[int] = None,
+                batch_size: Optional[int] = None,
                 trim_output_features: bool = True) -> tf.data.Dataset:
   """Get processed dataset with the model features.
 
@@ -1684,6 +1716,7 @@ def get_dataset(mixture_or_task_name: str,
     shard_info: number of shards and shard index information.
     verbose: if true, log the feature shapes.
     seed: a random seed to for shuffling tf.data.
+    batch_size: Optional batch size.
     trim_output_features: If True, it trims output features to be less than
         the length given by `sequence_length`.
 
@@ -1695,31 +1728,42 @@ def get_dataset(mixture_or_task_name: str,
         "feature_converter should be an instance of FeatureConverter.")
 
   mixture_or_task = get_mixture_or_task(mixture_or_task_name)
-
-  ds = mixture_or_task.get_dataset(
-      task_feature_lengths,
-      split=dataset_split,
-      use_cached=use_cached,
-      shuffle=shuffle,
-      seed=seed,
-      shard_info=shard_info,
-      num_epochs=num_epochs,
-      trim_output_features=trim_output_features)
-
-  ds = feature_converter(
-      ds,
-      task_feature_lengths=task_feature_lengths)
+  is_grain_task = False
+  if is_grain_task:
+    ds = mixture_or_task.get_dataset(
+        sequence_length=task_feature_lengths,
+        split=dataset_split,
+        use_cached=use_cached,
+        shuffle=shuffle,
+        seed=seed,
+        shard_info=shard_info,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        feature_converter=feature_converter,
+        trim_output_features=trim_output_features)
+  else:
+    ds = mixture_or_task.get_dataset(
+        task_feature_lengths,
+        split=dataset_split,
+        use_cached=use_cached,
+        shuffle=shuffle,
+        seed=seed,
+        shard_info=shard_info,
+        num_epochs=num_epochs,
+        trim_output_features=trim_output_features)
+    ds = feature_converter(ds, task_feature_lengths=task_feature_lengths)
+    if batch_size is not None:
+      ds = ds.batch(batch_size, drop_remainder=True)
 
   if verbose:
     logging.info(
         "The output dataset from seqio.get_dataset has the following features")
-    for feature_name, tensor_spec in ds.element_spec.items():
+    element_spec = utils.flatten_dict(ds.element_spec, delimiter=".")
+    for feature_name, tensor_spec in element_spec.items():
       if isinstance(tensor_spec, tf.TensorSpec):
         logging.info("feature: %s \t shape: %s \t dtype: %s", feature_name,
                      tensor_spec.shape.as_list(), tensor_spec.dtype.name)
-        continue
-      # Handle the case where ds is a nested map of depth 2.
-      for name, tspec in tensor_spec.items():
-        logging.info("feature: %s.%s \t shape: %s \t dtype: %s", feature_name,
-                     name, tspec.shape.as_list(), tspec.dtype.name)
+      else:
+        logging.error("Unknown tensor_spec type %s for feature %s.",
+                      type(tensor_spec), feature_name)
   return ds

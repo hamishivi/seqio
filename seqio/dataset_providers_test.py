@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import numpy as np
 from seqio import dataset_providers
 from seqio import feature_converters
 from seqio import metrics as metrics_lib
@@ -912,6 +913,8 @@ class TasksTest(test_utils.FakeTaskTest):
     self.assertListEqual(
         _get_formatted_shards_list("cached_plaintext_task", "train"),
         ["train.tfrecord-00000-of-00002", "train.tfrecord-00001-of-00002"])
+
+
 
 
 class MixturesTest(test_utils.FakeTaskTest):
